@@ -1,0 +1,4 @@
+/target
+.env
+billy-audit.ndjson
+*.ndjson

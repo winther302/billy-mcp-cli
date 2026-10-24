@@ -1,0 +1,24 @@
+[package]
+name = "billy-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Small, pipeable commands for the Billy accounting API"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["billy", "accounting", "bookkeeping", "cli", "denmark"]
+categories = ["command-line-utilities"]
+rust-version = "1.87"
+
+[[bin]]
+name = "billy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rust_decimal = "1"
+# arbitrary_precision keeps amounts exactly as Billy sends them (no f64 rounding);
+# preserve_order keeps fields in the order we emit them.
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+shlex = "1"
+ureq = { version = "2", features = ["json"] }
