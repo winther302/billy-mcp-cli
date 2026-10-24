@@ -55,7 +55,7 @@ impl Client {
             .set("Accept", "application/json")
             .set(
                 "User-Agent",
-                concat!("billy-cli/", env!("CARGO_PKG_VERSION")),
+                concat!("billy-mcp-cli/", env!("CARGO_PKG_VERSION")),
             )
     }
 

@@ -1,11 +1,12 @@
 [package]
-name = "billy-cli"
+name = "billy-mcp-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Small, pipeable commands for the Billy accounting API"
+description = "Pipeable CLI and MCP server for the Billy accounting API"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-keywords = ["billy", "accounting", "bookkeeping", "cli", "denmark"]
+repository = "https://github.com/winther302/billy-mcp-cli"
+keywords = ["billy", "accounting", "bookkeeping", "cli", "mcp"]
 categories = ["command-line-utilities"]
 rust-version = "1.87"
 

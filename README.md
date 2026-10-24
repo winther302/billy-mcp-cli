@@ -1,4 +1,4 @@
-# billy-cli
+# billy-mcp-cli
 
 Small, pipeable commands for the [Billy](https://www.billy.dk) accounting API,
 in the Unix tradition: each command does one thing, and commands pass
