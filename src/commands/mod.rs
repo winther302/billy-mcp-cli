@@ -85,6 +85,9 @@ pub enum Cmd {
     /// write: check changes against Billy; dry run unless --confirm-cvr is given
     Apply(writes::ApplyArgs),
 
+    /// serve these commands to AI assistants over MCP (stdio)
+    Mcp,
+
     /// run a whole pipeline, e.g. 'postings --period 2025 | sum signedAmount'
     Run(RunArgs),
 }
@@ -141,6 +144,8 @@ pub fn execute(cmd: Cmd, input: Input, out: &mut dyn Write) -> Result<()> {
         Cmd::Draft(a) => writes::draft(a)?,
         Cmd::Approve(_) => writes::approve(input.records("approve")?)?,
         Cmd::Apply(a) => return writes::apply(a, input.records("apply")?, out),
+
+        Cmd::Mcp => return crate::mcp::serve(),
 
         Cmd::Run(a) => return crate::pipeline::run(&a.pipeline, input, out),
     };

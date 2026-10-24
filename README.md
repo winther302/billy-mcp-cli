@@ -9,7 +9,8 @@ billy postings --account 1310 --period 2025-Q3 | billy sum signedAmount
 billy invoices --unpaid | billy sort dueDate | billy pick invoiceNo,dueDate,grossAmount | billy table
 ```
 
-It is built to be driven by people and by language models alike. A model sends
+It is built to be driven by people and by language models alike, and ships an
+MCP server (`billy mcp`, see below). A model sends
 one command string to `billy run`, which executes the pipeline in-process,
 without a shell:
 
@@ -109,6 +110,39 @@ billy daybook --state draft --api-type billy-cli | billy approve | billy apply -
 Inside `billy run`, `apply --confirm-cvr` is refused unless the process was
 started with `BILLY_RUN_WRITES=1`. A model can always prepare and dry-run
 changes, but only a person can switch on writes for it.
+
+## MCP server
+
+`billy mcp` serves the same commands to AI assistants over the
+[Model Context Protocol](https://modelcontextprotocol.io) (stdio). It offers a
+single tool, `billy`, which takes a pipeline string and runs it like
+`billy run`. The tool description carries the full command reference, so the
+assistant needs no other setup.
+
+Claude Code:
+
+```sh
+claude mcp add billy -e BILLY_KEY=your-token-here -- billy mcp
+```
+
+Claude Desktop and other clients (`claude_desktop_config.json` or equivalent):
+
+```json
+{
+  "mcpServers": {
+    "billy": {
+      "command": "billy",
+      "args": ["mcp"],
+      "env": { "BILLY_KEY": "your-token-here" }
+    }
+  }
+}
+```
+
+Writes stay off for the assistant: it can draft and dry-run changes, but
+`apply --confirm-cvr` is refused unless you add `"BILLY_RUN_WRITES": "1"` to
+the server's environment. Output over 100 KB is cut at a line boundary with a
+note telling the assistant to narrow its query.
 
 ## Environment
 

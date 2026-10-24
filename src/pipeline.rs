@@ -46,6 +46,7 @@ pub fn run(line: &str, input: Input, out: &mut dyn Write) -> Result<()> {
     for (i, (label, cmd)) in stages.iter().enumerate() {
         match cmd {
             Cmd::Run(_) => bail!("{label}: `run` cannot be nested"),
+            Cmd::Mcp => bail!("{label}: `mcp` starts a server and cannot be a pipeline stage"),
             Cmd::Table(_) if i != last => {
                 bail!("{label}: `table` output is for reading and must be the last stage")
             }

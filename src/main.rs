@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod env;
+mod mcp;
 mod period;
 mod pipeline;
 mod record;
