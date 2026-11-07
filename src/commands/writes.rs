@@ -5,9 +5,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::Args;
@@ -569,13 +572,7 @@ struct Audit {
 impl Audit {
     fn open(cvr: &str) -> Result<Self> {
         let path = env::audit_path();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| {
-                format!("opening audit log {}; nothing was changed", path.display())
-            })?;
+        let file = open_audit_file(&path)?;
         Ok(Self {
             file,
             path,
@@ -608,6 +605,32 @@ impl Audit {
         self.file.flush()?;
         Ok(())
     }
+}
+
+fn open_audit_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening audit log {}; nothing was changed", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        let mode = file.metadata()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "audit log {} is accessible by group or other users (mode {:04o}); \
+                 restrict it with `chmod 600` before applying changes",
+                path.display(),
+                mode & 0o7777
+            );
+        }
+    }
+
+    Ok(file)
 }
 
 fn utc_now() -> String {
@@ -685,5 +708,42 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_383), (2025, 10, 22));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_a_private_audit_log() {
+        let path = std::env::temp_dir().join(format!(
+            "billy-audit-private-{}-{}.ndjson",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let file = open_audit_file(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_an_audit_log_accessible_to_other_users() {
+        let path = std::env::temp_dir().join(format!(
+            "billy-audit-shared-{}-{}.ndjson",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = open_audit_file(&path).unwrap_err().to_string();
+        assert!(error.contains("chmod 600"), "{error}");
+        std::fs::remove_file(path).unwrap();
     }
 }
