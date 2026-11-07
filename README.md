@@ -103,7 +103,9 @@ billy daybook --state draft --api-type billy-cli | billy approve | billy apply -
 - Re-running is safe: a draft with the same marker (`--api-type`), date and
   voucher number is skipped.
 - Every applied change is appended to `billy-audit.ndjson`, next to the `.env`
-  holding the token, or at `BILLY_AUDIT_LOG`.
+  holding the token, or at `BILLY_AUDIT_LOG`. On Unix, new logs are created
+  owner-only; applying changes is refused if an existing log is accessible by
+  group or other users. Restrict it with `chmod 600 <path>` to continue.
 
 ### Language models
 
