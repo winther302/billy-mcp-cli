@@ -69,9 +69,12 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "billy", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "Use the `billy` tool to read the Billy accounting books. \
+        "instructions": "Use the `billy` tool to work with the Billy accounting books. \
             Start with a source command and pipe it through filters, e.g. \
             `postings --period 2025 | sum signedAmount --by accountNo | table`. \
+            Every API resource is reachable: `resources` lists them, `list`/`get` read \
+            any of them, and `create`/`update`/`delete`/`call` describe changes that \
+            `apply` dry-runs. Show the user the dry run before applying. \
             Append --help to any command for its flags.",
     })
 }
@@ -85,8 +88,10 @@ fn tool() -> Value {
             "Runs a pipeline of billy commands against the Billy accounting API and returns \
              its output. Write the pipeline without the `billy run` prefix, stages separated \
              by |. Sources print one JSON record per line; filters transform them; `table` \
-             renders the result. Changes are only made by `apply --confirm-cvr`, which is \
-             refused unless the person running this server allowed writes.\n\n{help}"
+             renders the result. Every Billy API resource is reachable through `list`, `get`, \
+             `create`, `update`, `delete` and `call`. Changes are only made by \
+             `apply --confirm-cvr`, which is refused unless the person running this server \
+             allowed writes (deletes and sending emails/e-invoices need separate permission).\n\n{help}"
         ),
         "inputSchema": {
             "type": "object",
@@ -111,7 +116,10 @@ fn tool() -> Value {
 /// Runs one pipeline with empty input: stdin is the protocol stream, not data.
 fn call(command: &str) -> (String, bool) {
     let mut buffer = Vec::new();
-    match crate::pipeline::run(&unwrap_run(command), Input::Bytes(Vec::new()), &mut buffer) {
+    let (result, notes) = crate::notes::capture(|| {
+        crate::pipeline::run(&unwrap_run(command), Input::Bytes(Vec::new()), &mut buffer)
+    });
+    let (text, is_error) = match result {
         Ok(()) => {
             let text = String::from_utf8_lossy(&buffer).into_owned();
             if text.is_empty() {
@@ -121,7 +129,14 @@ fn call(command: &str) -> (String, bool) {
             }
         }
         Err(e) => (format!("{e:#}"), true),
+    };
+    if notes.is_empty() {
+        return (text, is_error);
     }
+    (
+        format!("{}\n\n{}", text.trim_end(), notes.join("\n")),
+        is_error,
+    )
 }
 
 /// Models often write `billy run '<pipeline>'` out of habit; accept it.
@@ -221,6 +236,12 @@ mod tests {
         assert_eq!(r["error"]["code"], -32602);
         let r = request("resources/list", json!({}));
         assert_eq!(r["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn notes_reach_the_assistant() {
+        let (_, notes) = crate::notes::capture(|| crate::notes::note("hello"));
+        assert_eq!(notes, ["hello"]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod api;
 mod filters;
 mod sources;
 pub(crate) mod writes;
@@ -29,7 +30,22 @@ checks the whole batch against Billy and is a dry run unless given --confirm-cvr
   billy draft --date 2025-07-03 --text 'Husleje juli' --line 5820:12500 --line 1310:-12500 | billy apply
   billy daybook --state draft --api-type billy-cli | billy approve | billy apply --confirm-cvr <CVR>
 
-Inside `billy run`, apply only dry-runs unless BILLY_RUN_WRITES=1 is set.
+Every resource of the Billy API is reachable with the generic commands
+(`billy resources` lists them and what each supports). Fields are key=text or
+key:=json (numbers, true/false, arrays, objects); dotted keys nest:
+
+  billy list bankLines isMatched=false | billy table
+  billy get invoices <id> include=invoice.lines:embed
+  billy create contacts name='Acme ApS' isCustomer:=true countryId=DK --unique name | billy apply
+  billy invoices --state draft | billy update invoices state=approved | billy apply
+  billy call POST invoices/<id>/emails email.contactPersonId=<id> email.emailSubject=Faktura email.emailBody=... | billy apply
+  billy call GET 'invoiceLogs?invoiceId=<id>'
+
+Deletes also need `apply --allow-delete`; emails, e-invoices and reminders also
+need `apply --allow-send`.
+
+Inside `billy run`, apply only dry-runs unless BILLY_RUN_WRITES=1 is set, and
+deletes and sends also need BILLY_RUN_DELETES=1 and BILLY_RUN_SENDS=1.
 Every applied change is logged to billy-audit.ndjson.";
 
 #[derive(Parser, Debug)]
@@ -63,6 +79,13 @@ pub enum Cmd {
     /// source: the daybooks (journals) drafts can go in
     Daybooks(sources::OrgArgs),
 
+    /// source: every Billy resource and the operations it supports
+    Resources(api::ResourcesArgs),
+    /// source: list any resource, e.g. `list bankLines accountId=… include=…`
+    List(api::ListArgs),
+    /// source: fetch records by id, or `get organization` / `get user`
+    Get(api::GetArgs),
+
     /// filter: keep records matching every condition
     Where(filters::WhereArgs),
     /// filter: keep only the named fields
@@ -82,6 +105,16 @@ pub enum Cmd {
     Draft(writes::DraftArgs),
     /// write: turn daybook records into approval requests (changes nothing until `apply`)
     Approve(writes::ApproveArgs),
+    /// write: describe uploading a PDF/image to a daybook transaction or the inbox (changes nothing until `apply`)
+    Attach(writes::AttachArgs),
+    /// write: describe creating a record of any resource (changes nothing until `apply`)
+    Create(api::CreateArgs),
+    /// write: describe changing fields of a record, or of every piped record (changes nothing until `apply`)
+    Update(api::UpdateArgs),
+    /// write: describe deleting records by id or piped (changes nothing until `apply`)
+    Delete(api::DeleteArgs),
+    /// any API endpoint: GET reads now; POST/PUT/PATCH/DELETE describe a change for `apply`
+    Call(api::CallArgs),
     /// write: check changes against Billy; dry run unless --confirm-cvr is given
     Apply(writes::ApplyArgs),
 
@@ -132,6 +165,9 @@ pub fn execute(cmd: Cmd, input: Input, out: &mut dyn Write) -> Result<()> {
         Cmd::Contacts(a) => sources::contacts(a)?,
         Cmd::Daybook(a) => sources::daybook(a)?,
         Cmd::Daybooks(a) => sources::daybooks(a)?,
+        Cmd::Resources(a) => api::resources(a),
+        Cmd::List(a) => api::list(a)?,
+        Cmd::Get(a) => api::get(a, || input.records("get"))?,
 
         Cmd::Where(a) => filters::where_(a, input.records("where")?)?,
         Cmd::Pick(a) => filters::pick(a, input.records("pick")?),
@@ -143,6 +179,11 @@ pub fn execute(cmd: Cmd, input: Input, out: &mut dyn Write) -> Result<()> {
 
         Cmd::Draft(a) => writes::draft(a)?,
         Cmd::Approve(_) => writes::approve(input.records("approve")?)?,
+        Cmd::Attach(a) => writes::attach(a)?,
+        Cmd::Create(a) => api::create(a)?,
+        Cmd::Update(a) => api::update(a, || input.records("update"))?,
+        Cmd::Delete(a) => api::delete(a, || input.records("delete"))?,
+        Cmd::Call(a) => api::call(a)?,
         Cmd::Apply(a) => return writes::apply(a, input.records("apply")?, out),
 
         Cmd::Mcp => return crate::mcp::serve(),

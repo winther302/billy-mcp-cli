@@ -2,6 +2,7 @@ mod client;
 mod commands;
 mod env;
 mod mcp;
+mod notes;
 mod period;
 mod pipeline;
 mod record;

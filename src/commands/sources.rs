@@ -239,7 +239,7 @@ pub struct DaybookArgs {
 }
 
 pub fn org(a: OrgArgs) -> Result<Vec<Value>> {
-    let mut payload = Client::from_env()?.get("organization", &Vec::new())?;
+    let mut payload = Client::from_env()?.get("organization", &Query::new())?;
     let org = payload.get_mut("organization").map(Value::take);
     let Some(org @ Value::Object(_)) = org else {
         bail!("response for /organization has no organization");
@@ -249,7 +249,7 @@ pub fn org(a: OrgArgs) -> Result<Vec<Value>> {
 
 pub fn accounts(a: AccountsArgs) -> Result<Vec<Value>> {
     let mut records: Vec<Value> = Client::from_env()?
-        .list_all("accounts", &Vec::new())?
+        .list_all("accounts", &Query::new())?
         .into_iter()
         .filter(|r| a.archived || !is_true(r, "isArchived"))
         .map(|r| project(r, ACCOUNT_FIELDS, a.out.all))
@@ -260,7 +260,7 @@ pub fn accounts(a: AccountsArgs) -> Result<Vec<Value>> {
 
 pub fn postings(a: PostingsArgs) -> Result<Vec<Value>> {
     let client = Client::from_env()?;
-    let accounts = client.list_all("accounts", &Vec::new())?;
+    let accounts = client.list_all("accounts", &Query::new())?;
     let account_no: HashMap<String, Value> = accounts
         .iter()
         .filter_map(|acc| Some((record::text(acc.get("id")?), acc.get("accountNo")?.clone())))
@@ -330,7 +330,7 @@ fn documents(resource: &str, fields: &[&str], a: DocArgs) -> Result<Vec<Value>> 
 }
 
 pub fn contacts(a: ContactsArgs) -> Result<Vec<Value>> {
-    let records = Client::from_env()?.list_all("contacts", &Vec::new())?;
+    let records = Client::from_env()?.list_all("contacts", &Query::new())?;
     Ok(records
         .into_iter()
         .filter(|r| a.archived || !is_true(r, "isArchived"))
@@ -409,7 +409,7 @@ fn project(record: Value, fields: &[&str], all: bool) -> Value {
 }
 
 pub fn daybooks(a: OrgArgs) -> Result<Vec<Value>> {
-    let records = Client::from_env()?.list_all("daybooks", &Vec::new())?;
+    let records = Client::from_env()?.list_all("daybooks", &Query::new())?;
     Ok(records
         .into_iter()
         .map(|r| project(r, DAYBOOKS_FIELDS, a.out.all))

@@ -14,7 +14,8 @@ use clap::Args;
 use rust_decimal::Decimal;
 use serde_json::{json, Map, Value};
 
-use crate::client::Client;
+use super::api;
+use crate::client::{Client, Query};
 use crate::{env, period, record};
 
 /// Set while executing `billy run`, where a model may be the author.
@@ -50,10 +51,36 @@ pub struct DraftArgs {
 pub struct ApproveArgs {}
 
 #[derive(Args, Debug)]
+pub struct AttachArgs {
+    /// PDF or image to upload
+    file: PathBuf,
+    /// Daybook transaction id to attach it to; without --to it goes to Billy's inbox
+    #[arg(long, value_name = "ID")]
+    to: Option<String>,
+    /// File name shown in Billy [default: the file's own name]
+    #[arg(long)]
+    name: Option<String>,
+}
+
+/// Largest file `attach` will upload.
+const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
+#[derive(Args, Debug)]
 pub struct ApplyArgs {
     /// The company's CVR number; without it apply is a dry run that changes nothing
     #[arg(long, value_name = "CVR")]
     confirm_cvr: Option<String>,
+    /// Allow deletes in this batch (inside `billy run` also needs BILLY_RUN_DELETES=1)
+    #[arg(long)]
+    allow_delete: bool,
+    /// Allow sending emails, e-invoices and reminders to people outside the company
+    /// (inside `billy run` also needs BILLY_RUN_SENDS=1)
+    #[arg(long)]
+    allow_send: bool,
+    /// Send creates and updates of the same resource as one bulk save, and its
+    /// deletes as one bulk delete; each bulk request succeeds or fails as a whole
+    #[arg(long)]
+    bulk: bool,
 }
 
 /// Describes one balanced draft. Offline: nothing is checked against Billy yet.
@@ -122,6 +149,73 @@ fn parse_line(spec: &str) -> Result<(String, Decimal, Option<String>)> {
     Ok((account.to_string(), signed, text))
 }
 
+/// Describes uploading one file, to a daybook transaction or to the inbox.
+/// Offline apart from reading the file's size.
+pub fn attach(a: AttachArgs) -> Result<Vec<Value>> {
+    let path = std::fs::canonicalize(&a.file)
+        .with_context(|| format!("cannot read {}", a.file.display()))?;
+    let meta = std::fs::metadata(&path)?;
+    if !meta.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    let name = match a.name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        Some(_) => bail!("--name must not be empty"),
+        None => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("{} has no file name", path.display()))?,
+    };
+    content_type(&name)?;
+    let mut map = Map::new();
+    map.insert("op".into(), json!("attach-file"));
+    map.insert("file".into(), json!(path.to_string_lossy()));
+    map.insert("fileName".into(), json!(name));
+    map.insert("size".into(), json!(meta.len()));
+    map.insert("to".into(), json!(a.to.filter(|t| !t.trim().is_empty())));
+    Ok(vec![Value::Object(map)])
+}
+
+fn content_type(name: &str) -> Result<&'static str> {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("pdf") => Ok("application/pdf"),
+        Some("png") => Ok("image/png"),
+        Some("jpg" | "jpeg") => Ok("image/jpeg"),
+        _ => bail!("`{name}`: only .pdf, .png, .jpg and .jpeg files can be attached"),
+    }
+}
+
+/// Billy's file names travel in an HTTP header, so keep them to plain ASCII.
+fn header_safe_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        match c {
+            'æ' => out.push_str("ae"),
+            'Æ' => out.push_str("Ae"),
+            'ø' => out.push_str("oe"),
+            'Ø' => out.push_str("Oe"),
+            'å' => out.push_str("aa"),
+            'Å' => out.push_str("Aa"),
+            'ä' | 'á' | 'à' => out.push('a'),
+            'ö' | 'ó' => out.push('o'),
+            'ü' | 'ú' => out.push('u'),
+            'é' | 'è' => out.push('e'),
+            c if c.is_ascii() && !c.is_ascii_control() => out.push(c),
+            _ => out.push('_'),
+        }
+    }
+    out
+}
+
+/// A file name as Billy stores it (it turns spaces into dashes), for comparing.
+fn name_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase()
+}
+
 /// Turns daybook records into approval requests.
 pub fn approve(records: Vec<Value>) -> Result<Vec<Value>> {
     records
@@ -152,7 +246,61 @@ pub fn approve(records: Vec<Value>) -> Result<Vec<Value>> {
 enum Action {
     Create(Value),
     Approve(String),
+    Upload(Upload),
+    Request(Request),
     Skip(String),
+}
+
+/// A generic change from `create`, `update`, `delete` or `call`.
+struct Request {
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    /// Past-tense status once done: created, updated, deleted or called.
+    done: &'static str,
+    /// The record's id when known before the request (update, delete).
+    id: Option<String>,
+    /// Plural resource whose first record in the response carries the new id.
+    created_in: Option<String>,
+    kind: Risk,
+    /// How this change joins a bulk request under `apply --bulk`.
+    bulk: Option<Bulk>,
+}
+
+/// One record's part in a bulk request on `resource`.
+enum Bulk {
+    /// A record to save: new fields, or changes plus its id.
+    Save {
+        resource: String,
+        record: Value,
+    },
+    Delete {
+        resource: String,
+        id: String,
+    },
+}
+
+impl Bulk {
+    fn group(&self) -> (String, bool) {
+        match self {
+            Bulk::Save { resource, .. } => (resource.clone(), true),
+            Bulk::Delete { resource, .. } => (resource.clone(), false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Risk {
+    Change,
+    Delete,
+    Send,
+}
+
+struct Upload {
+    path: PathBuf,
+    file_name: String,
+    content_type: &'static str,
+    owner: Option<String>,
 }
 
 struct Planned {
@@ -183,11 +331,13 @@ struct Books {
     accounts: HashMap<String, Value>,
     daybooks: Vec<Value>,
     existing: HashMap<(String, String), Vec<Value>>,
+    /// (owner id or "" for the inbox, file name, size) of attachments already in Billy.
+    attachments: Option<HashSet<(String, String, u64)>>,
 }
 
 impl Books {
     fn load(client: &Client) -> Result<Self> {
-        let mut payload = client.get("organization", &Vec::new())?;
+        let mut payload = client.get("organization", &Query::new())?;
         let org = payload
             .get_mut("organization")
             .map(Value::take)
@@ -195,7 +345,7 @@ impl Books {
             .ok_or_else(|| anyhow!("response for /organization has no organization"))?;
         let text = |key: &str| org.get(key).map(record::text).filter(|t| !t.is_empty());
         let accounts = client
-            .list_all("accounts", &Vec::new())?
+            .list_all("accounts", &Query::new())?
             .into_iter()
             .filter_map(|acc| Some((record::text(acc.get("accountNo")?), acc)))
             .collect();
@@ -205,9 +355,137 @@ impl Books {
             currency: text("baseCurrencyId").unwrap_or_else(|| "DKK".into()),
             locked_through: text("fiscalLockingDate"),
             accounts,
-            daybooks: client.list_all("daybooks", &Vec::new())?,
+            daybooks: client.list_all("daybooks", &Query::new())?,
             existing: HashMap::new(),
+            attachments: None,
         })
+    }
+
+    /// Attachments already in Billy, keyed for spotting an upload made twice.
+    fn attachments(&mut self, client: &Client) -> Result<&HashSet<(String, String, u64)>> {
+        if self.attachments.is_none() {
+            let mut keys = HashSet::new();
+            for att in client.list_all("attachments", &Query::new())? {
+                let file_id = record::text(&att["fileId"]);
+                if file_id.is_empty() {
+                    continue;
+                }
+                let mut payload = client.get(&format!("files/{file_id}"), &Query::new())?;
+                let file = payload.get_mut("file").map(Value::take).unwrap_or_default();
+                keys.insert((
+                    record::text(&att["ownerId"]),
+                    name_key(&record::text(&file["fileName"])),
+                    file["fileSize"].as_u64().unwrap_or(0),
+                ));
+            }
+            self.attachments = Some(keys);
+        }
+        Ok(self.attachments.as_ref().expect("loaded above"))
+    }
+
+    fn plan_attach(&mut self, client: &Client, r: &Value) -> Result<(Planned, String)> {
+        let path = r
+            .get("file")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("missing file"))?;
+        let meta =
+            std::fs::metadata(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a file", path.display());
+        }
+        if meta.len() == 0 {
+            bail!("{} is empty", path.display());
+        }
+        if meta.len() > MAX_ATTACHMENT_BYTES {
+            bail!("{} is larger than 20 MB", path.display());
+        }
+        let shown = r
+            .get("fileName")
+            .and_then(Value::as_str)
+            .filter(|n| !n.trim().is_empty())
+            .ok_or_else(|| anyhow!("missing fileName"))?;
+        let content_type = content_type(shown)?;
+        let file_name = header_safe_name(shown);
+        let to = r
+            .get("to")
+            .and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_string);
+
+        let mut summary = json!({
+            "op": "attach-file",
+            "fileName": &file_name,
+            "size": meta.len(),
+            "to": to.as_deref().unwrap_or("inbox"),
+        });
+        // `--to <id>` means a daybook transaction; `--to bill:<id>` or
+        // `--to invoice:<id>` names the owner type explicitly.
+        let owner = to.as_deref().map(|t| match t.split_once(':') {
+            Some((kind, id)) => (kind.to_string(), id.to_string()),
+            None => ("daybookTransaction".to_string(), t.to_string()),
+        });
+        if let Some((kind, id)) = &owner {
+            if !matches!(kind.as_str(), "daybookTransaction" | "bill" | "invoice") {
+                bail!("--to {kind}:{id}: files attach to a daybookTransaction, bill or invoice");
+            }
+            let mut payload = client.get(&format!("{kind}s/{id}"), &Query::new())?;
+            let rec = payload
+                .get_mut(kind.as_str())
+                .map(Value::take)
+                .filter(Value::is_object)
+                .ok_or_else(|| anyhow!("Billy has no {kind} {id}"))?;
+            if record::text(&rec["state"]) == "voided" {
+                bail!("{kind} {id} is voided");
+            }
+            for f in ["voucherNo", "invoiceNo", "description", "lineDescription"] {
+                if !rec[f].is_null() {
+                    summary[f] = rec[f].clone();
+                }
+            }
+        }
+        let owner_id = owner.as_ref().map(|(_, id)| id.clone()).unwrap_or_default();
+        let key = format!("attach|{owner_id}|{file_name}|{}", meta.len());
+        let exists =
+            self.attachments(client)?
+                .contains(&(owner_id, name_key(&file_name), meta.len()));
+        let action = if exists {
+            Action::Skip("a file with this name and size is already attached there".into())
+        } else {
+            Action::Upload(Upload {
+                path,
+                file_name,
+                content_type,
+                owner: owner.map(|(kind, id)| format!("{kind}:{id}")),
+            })
+        };
+        Ok((Planned { summary, action }, key))
+    }
+
+    fn upload(&self, client: &Client, u: &Upload) -> Result<String> {
+        let bytes =
+            std::fs::read(&u.path).with_context(|| format!("reading {}", u.path.display()))?;
+        let resp = client.post_file(&u.file_name, u.content_type, &bytes)?;
+        let file_id = resp
+            .pointer("/files/0/id")
+            .or_else(|| resp.pointer("/file/id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Billy accepted the upload but returned no file id"))?;
+        let mut attachment = json!({
+            "organizationId": self.org_id,
+            "fileId": file_id,
+        });
+        if let Some(owner) = &u.owner {
+            attachment["ownerReference"] = json!(owner);
+        }
+        let resp = client.post("attachments", &json!({ "attachment": attachment }))?;
+        resp.pointer("/attachments/0/id")
+            .or_else(|| resp.pointer("/attachment/id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow!("file {file_id} was uploaded but Billy returned no attachment id")
+            })
     }
 
     fn check_unlocked(&self, date: &str) -> Result<()> {
@@ -418,6 +696,236 @@ impl Books {
     }
 }
 
+impl Books {
+    fn plan_generic_create(&mut self, client: &Client, r: &Value) -> Result<(Planned, String)> {
+        let res = api::resource(&record::text(&r["resource"]))?;
+        res.require("create")?;
+        let mut rec = r
+            .get("record")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or_else(|| anyhow!("missing record"))?;
+        if res.org_scoped && rec.get("organizationId").is_none() {
+            rec["organizationId"] = json!(self.org_id);
+        }
+        let key = format!("create|{}|{}", res.name, rec);
+        let unique: Vec<String> = r
+            .get("unique")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(record::text)
+            .collect();
+        let mut summary = json!({ "op": "create", "resource": res.name, "record": rec });
+        if !unique.is_empty() {
+            summary["unique"] = json!(unique);
+            let same = |x: &Value| {
+                unique
+                    .iter()
+                    .all(|f| x.get(f).map(record::text) == rec.get(f).map(record::text))
+            };
+            let q: Vec<(String, String)> = unique
+                .iter()
+                .map(|f| (f.clone(), record::text(&rec[f])))
+                .collect();
+            // Billy ignores filters it does not know, so check the values here too.
+            let found = client.list_all(res.name, &q)?;
+            if let Some(existing) = found.iter().find(|x| same(x)) {
+                let id = record::text(&existing["id"]);
+                let action = Action::Skip(format!(
+                    "a {} with the same {} exists: {id}",
+                    res.singular(),
+                    unique.join(", ")
+                ));
+                return Ok((Planned { summary, action }, key));
+            }
+        }
+        let kind = if api::sends("POST", res.name) {
+            Risk::Send
+        } else {
+            Risk::Change
+        };
+        let action = Action::Request(Request {
+            method: "POST",
+            path: res.name.to_string(),
+            body: Some(json!({ res.singular(): rec })),
+            done: "created",
+            id: None,
+            created_in: Some(res.name.to_string()),
+            kind,
+            bulk: (kind == Risk::Change).then(|| Bulk::Save {
+                resource: res.name.to_string(),
+                record: rec.clone(),
+            }),
+        });
+        Ok((Planned { summary, action }, key))
+    }
+
+    /// The current record, or an error naming what is missing.
+    fn fetch(client: &Client, res: &api::Resource, id: &str) -> Result<Value> {
+        let mut payload = client.get(&format!("{}/{id}", res.name), &Query::new())?;
+        payload
+            .get_mut(res.singular().as_str())
+            .map(Value::take)
+            .filter(Value::is_object)
+            .ok_or_else(|| anyhow!("Billy has no {} {id}", res.singular()))
+    }
+
+    fn plan_update(&self, client: &Client, r: &Value) -> Result<(Planned, String)> {
+        let res = api::resource(&record::text(&r["resource"]))?;
+        res.require("update")?;
+        let id = r
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("missing id"))?;
+        let Some(Value::Object(changes)) = r.get("changes") else {
+            bail!("missing changes");
+        };
+        let current = Self::fetch(client, res, id)?;
+        let mut diff = Map::new();
+        let mut body = Map::new();
+        for (k, v) in changes {
+            let before = current.get(k).cloned().unwrap_or(Value::Null);
+            if !same_value(&before, v) {
+                diff.insert(k.clone(), json!({ "from": before, "to": v }));
+                body.insert(k.clone(), v.clone());
+            }
+        }
+        let summary = json!({
+            "op": "update",
+            "resource": res.name,
+            "id": id,
+            "label": label(&current),
+            "changes": diff,
+        });
+        let key = format!(
+            "update|{}|{id}|{}",
+            res.name,
+            Value::Object(changes.clone())
+        );
+        let action = if body.is_empty() {
+            Action::Skip("already has these values".into())
+        } else {
+            let mut record = body.clone();
+            record.insert("id".into(), json!(id));
+            Action::Request(Request {
+                method: "PUT",
+                path: format!("{}/{id}", res.name),
+                body: Some(json!({ res.singular(): body })),
+                done: "updated",
+                id: Some(id.to_string()),
+                created_in: None,
+                kind: Risk::Change,
+                bulk: Some(Bulk::Save {
+                    resource: res.name.to_string(),
+                    record: Value::Object(record),
+                }),
+            })
+        };
+        Ok((Planned { summary, action }, key))
+    }
+
+    fn plan_delete(&self, client: &Client, r: &Value) -> Result<(Planned, String)> {
+        let res = api::resource(&record::text(&r["resource"]))?;
+        res.require("delete")?;
+        let id = r
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("missing id"))?;
+        let current = Self::fetch(client, res, id)?;
+        let summary =
+            json!({ "op": "delete", "resource": res.name, "id": id, "label": label(&current) });
+        let action = Action::Request(Request {
+            method: "DELETE",
+            path: format!("{}/{id}", res.name),
+            body: None,
+            done: "deleted",
+            id: Some(id.to_string()),
+            created_in: None,
+            kind: Risk::Delete,
+            bulk: Some(Bulk::Delete {
+                resource: res.name.to_string(),
+                id: id.to_string(),
+            }),
+        });
+        Ok((
+            Planned { summary, action },
+            format!("delete|{}|{id}", res.name),
+        ))
+    }
+
+    fn plan_call(&self, r: &Value) -> Result<(Planned, String)> {
+        let method = match record::text(&r["method"]).to_ascii_uppercase().as_str() {
+            "POST" => "POST",
+            "PUT" => "PUT",
+            "PATCH" => "PATCH",
+            "DELETE" => "DELETE",
+            other => bail!("method `{other}` cannot be applied; use POST, PUT, PATCH or DELETE"),
+        };
+        let path = api::clean_path(&record::text(&r["path"]))?;
+        let body = r.get("body").filter(|b| !b.is_null()).cloned();
+        let kind = if method == "DELETE" {
+            Risk::Delete
+        } else if api::sends(method, &path) {
+            Risk::Send
+        } else {
+            Risk::Change
+        };
+        let summary = json!({ "op": "call", "method": method, "path": &path, "body": &body });
+        let key = format!("call|{method}|{path}|{}", body.clone().unwrap_or_default());
+        let action = Action::Request(Request {
+            method,
+            path,
+            body,
+            done: "called",
+            id: None,
+            created_in: None,
+            kind,
+            bulk: None,
+        });
+        Ok((Planned { summary, action }, key))
+    }
+}
+
+/// Equal as JSON, or as text for scalars ("100" and 100, "true" and true).
+fn same_value(a: &Value, b: &Value) -> bool {
+    if a == b {
+        return true;
+    }
+    let scalar = |v: &Value| !v.is_object() && !v.is_array() && !v.is_null();
+    scalar(a)
+        && scalar(b)
+        && match (record::decimal(a), record::decimal(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => record::text(a) == record::text(b),
+        }
+}
+
+/// A few identifying fields of a record, for summaries.
+fn label(rec: &Value) -> Value {
+    let mut out = Map::new();
+    for f in [
+        "name",
+        "invoiceNo",
+        "voucherNo",
+        "suppliersInvoiceNo",
+        "accountNo",
+        "entryDate",
+        "description",
+        "lineDescription",
+        "state",
+        "amount",
+        "grossAmount",
+    ] {
+        if let Some(v) = rec.get(f).filter(|v| !v.is_null()) {
+            out.insert(f.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 fn line_signature(tx: &Value) -> Vec<String> {
     let mut signature: Vec<String> = tx
         .get("lines")
@@ -443,7 +951,7 @@ fn line_signature(tx: &Value) -> Vec<String> {
 
 pub fn apply(a: ApplyArgs, records: Vec<Value>, out: &mut dyn Write) -> Result<()> {
     if records.is_empty() {
-        bail!("nothing to apply; pipe the output of `billy draft` or `billy approve` into apply");
+        bail!("nothing to apply; pipe the output of draft, approve, attach, create, update, delete or call into apply");
     }
     let execute = a.confirm_cvr.is_some();
     if execute
@@ -479,9 +987,24 @@ pub fn apply(a: ApplyArgs, records: Vec<Value>, out: &mut dyn Write) -> Result<(
                 let key = format!("approve|{}", record::text(&plan.summary["id"]));
                 (plan, key)
             }
+            Some("attach-file") => books
+                .plan_attach(&client, r)
+                .with_context(|| format!("record {n} (attach-file)"))?,
+            Some("create") => books
+                .plan_generic_create(&client, r)
+                .with_context(|| format!("record {n} (create {})", record::text(&r["resource"])))?,
+            Some("update") => books
+                .plan_update(&client, r)
+                .with_context(|| format!("record {n} (update {})", record::text(&r["resource"])))?,
+            Some("delete") => books
+                .plan_delete(&client, r)
+                .with_context(|| format!("record {n} (delete {})", record::text(&r["resource"])))?,
+            Some("call") => books
+                .plan_call(r)
+                .with_context(|| format!("record {n} (call)"))?,
             Some(other) => bail!("record {n}: unknown op `{other}`"),
             None => bail!(
-                "record {n} is not a change; apply reads the output of `billy draft` or `billy approve`"
+                "record {n} is not a change; apply reads the output of draft, approve, attach, create, update, delete or call"
             ),
         };
         if !seen.insert(key) && !matches!(plan.action, Action::Skip(_)) {
@@ -490,24 +1013,97 @@ pub fn apply(a: ApplyArgs, records: Vec<Value>, out: &mut dyn Write) -> Result<(
         planned.push(plan);
     }
 
+    let risky = |risk: Risk| {
+        planned
+            .iter()
+            .any(|p| matches!(&p.action, Action::Request(rq) if rq.kind == risk))
+    };
+    let (deletes, sends) = (risky(Risk::Delete), risky(Risk::Send));
+
     if !execute {
         for plan in &planned {
-            let status = match plan.action {
-                Action::Create(_) => "would-create",
-                Action::Approve(_) => "would-approve",
-                Action::Skip(_) => "skip",
+            let status = match &plan.action {
+                Action::Create(_) => "would-create".to_string(),
+                Action::Approve(_) => "would-approve".to_string(),
+                Action::Upload(_) => "would-attach".to_string(),
+                Action::Request(rq) => match rq.done {
+                    "created" => "would-create",
+                    "updated" => "would-update",
+                    "deleted" => "would-delete",
+                    _ => "would-call",
+                }
+                .to_string(),
+                Action::Skip(_) => "skip".to_string(),
             };
-            record::emit(out, &[plan.result(status, None)])?;
+            record::emit(out, &[plan.result(&status, None)])?;
         }
-        eprintln!(
-            "billy apply: dry run, nothing was changed. Add --confirm-cvr <company CVR> to apply."
+        if deletes && !a.allow_delete {
+            crate::notes::note(
+                "billy apply: this batch deletes records; applying it also needs --allow-delete.",
+            );
+        }
+        if sends && !a.allow_send {
+            crate::notes::note("billy apply: this batch sends to people outside the company; applying it also needs --allow-send.");
+        }
+        crate::notes::note(
+            "billy apply: dry run, nothing was changed. Add --confirm-cvr <company CVR> to apply.",
         );
         return Ok(());
     }
 
+    let in_run = IN_RUN.load(Ordering::Relaxed);
+    if deletes {
+        if !a.allow_delete {
+            bail!(
+                "this batch deletes records; add --allow-delete to apply it. Nothing was changed"
+            );
+        }
+        if in_run && std::env::var("BILLY_RUN_DELETES").as_deref() != Ok("1") {
+            bail!("deletes through `billy run` are switched off; a person must start it with BILLY_RUN_DELETES=1. Nothing was changed");
+        }
+    }
+    if sends {
+        if !a.allow_send {
+            bail!("this batch sends emails or e-invoices; add --allow-send to apply it. Nothing was changed");
+        }
+        if in_run && std::env::var("BILLY_RUN_SENDS").as_deref() != Ok("1") {
+            bail!("sending through `billy run` is switched off; a person must start it with BILLY_RUN_SENDS=1. Nothing was changed");
+        }
+    }
+
     let mut audit = Audit::open(&books.cvr)?;
     let mut applied = 0;
-    for plan in &planned {
+    for group in batches(&planned, a.bulk) {
+        if group.len() > 1 {
+            let plans: Vec<&Planned> = group.iter().map(|&i| &planned[i]).collect();
+            match run_bulk(&client, &plans) {
+                Ok(results) => {
+                    for (plan, (status, id)) in plans.iter().zip(results) {
+                        audit.log(plan, status, Some(&id), None)?;
+                        applied += 1;
+                        let mut rec = plan.result(
+                            status,
+                            Some(&id).filter(|i| !i.is_empty()).map(String::as_str),
+                        );
+                        rec["bulk"] = json!(true);
+                        record::emit(out, &[rec])?;
+                    }
+                    out.flush()?;
+                }
+                Err(e) => {
+                    for plan in &plans {
+                        audit.log(plan, "failed", None, Some(&format!("{e:#}")))?;
+                    }
+                    bail!(
+                        "{e:#}\nthe bulk request of {} change(s) failed as a whole; {applied} earlier change(s) in this batch were applied (see {})",
+                        plans.len(),
+                        audit.path.display()
+                    );
+                }
+            }
+            continue;
+        }
+        let plan = &planned[group[0]];
         let outcome = match &plan.action {
             Action::Skip(_) => {
                 record::emit(out, &[plan.result("skipped", None)])?;
@@ -523,6 +1119,10 @@ pub fn apply(a: ApplyArgs, records: Vec<Value>, out: &mut dyn Write) -> Result<(
                     &json!({ "daybookTransaction": { "state": "approved" } }),
                 )
                 .map(|_| ("approved", id.clone())),
+            Action::Upload(u) => books.upload(&client, u).map(|id| ("attached", id)),
+            Action::Request(rq) => client
+                .send(rq.method, &rq.path, rq.body.as_ref())
+                .map(|resp| (rq.done, request_id(rq, &resp))),
         };
         match outcome {
             Ok((status, id)) => {
@@ -540,11 +1140,140 @@ pub fn apply(a: ApplyArgs, records: Vec<Value>, out: &mut dyn Write) -> Result<(
             }
         }
     }
-    eprintln!(
+    crate::notes::note(format!(
         "billy apply: {applied} change(s) applied, logged in {}",
         audit.path.display()
-    );
+    ));
     Ok(())
+}
+
+/// The order changes are executed in: one change per step, or with `bulk`,
+/// generic saves and deletes of the same resource joined into one step at the
+/// place of the first of them.
+fn batches(planned: &[Planned], bulk: bool) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut open: HashMap<(String, bool), usize> = HashMap::new();
+    for (i, plan) in planned.iter().enumerate() {
+        let group = match &plan.action {
+            Action::Request(Request { bulk: Some(b), .. }) if bulk => Some(b.group()),
+            _ => None,
+        };
+        match group {
+            Some(g) => match open.get(&g) {
+                Some(&at) => out[at].push(i),
+                None => {
+                    open.insert(g, out.len());
+                    out.push(vec![i]);
+                }
+            },
+            None => out.push(vec![i]),
+        }
+    }
+    out
+}
+
+/// Executes changes sharing one bulk group: `PATCH /<resource>` with every
+/// record, or `DELETE /<resource>?ids[]=…`.
+fn run_bulk(client: &Client, plans: &[&Planned]) -> Result<Vec<(&'static str, String)>> {
+    let parts: Vec<(&Request, &Bulk)> = plans
+        .iter()
+        .filter_map(|p| match &p.action {
+            Action::Request(rq) => rq.bulk.as_ref().map(|b| (rq, b)),
+            _ => None,
+        })
+        .collect();
+    if parts.len() != plans.len() {
+        bail!("internal error: a bulk group holds a change that cannot be bulked");
+    }
+    match parts[0].1 {
+        Bulk::Save { resource, .. } => {
+            let records: Vec<Value> = parts
+                .iter()
+                .map(|(_, b)| match b {
+                    Bulk::Save { record, .. } => record.clone(),
+                    Bulk::Delete { .. } => Value::Null,
+                })
+                .collect();
+            let resp = client.send(
+                "PATCH",
+                resource,
+                Some(&json!({ resource.as_str(): records })),
+            )?;
+            let returned = resp.get(resource.as_str()).and_then(Value::as_array);
+            // New records' ids, in order, when Billy returns exactly one record per change.
+            let positional = returned.filter(|r| r.len() == parts.len());
+            Ok(parts
+                .iter()
+                .enumerate()
+                .map(|(i, (rq, _))| {
+                    let id = rq.id.clone().unwrap_or_else(|| {
+                        positional
+                            .and_then(|r| r[i].get("id").and_then(Value::as_str))
+                            .unwrap_or_default()
+                            .to_string()
+                    });
+                    (rq.done, id)
+                })
+                .collect())
+        }
+        Bulk::Delete { resource, .. } => {
+            let ids: Vec<&str> = parts
+                .iter()
+                .filter_map(|(_, b)| match b {
+                    Bulk::Delete { id, .. } => Some(id.as_str()),
+                    Bulk::Save { .. } => None,
+                })
+                .collect();
+            let query = ids
+                .iter()
+                .map(|id| format!("ids%5B%5D={}", url_encode(id)))
+                .collect::<Vec<_>>()
+                .join("&");
+            client.send("DELETE", &format!("{resource}?{query}"), None)?;
+            Ok(parts
+                .iter()
+                .map(|(rq, _)| (rq.done, rq.id.clone().unwrap_or_default()))
+                .collect())
+        }
+    }
+}
+
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The id a generic request concerns: known beforehand, or the first record
+/// Billy returns.
+fn request_id(rq: &Request, resp: &Value) -> String {
+    if let Some(id) = &rq.id {
+        return id.clone();
+    }
+    if let Some(res) = &rq.created_in {
+        if let Some(id) = resp
+            .pointer(&format!("/{res}/0/id"))
+            .and_then(Value::as_str)
+        {
+            return id.to_string();
+        }
+    }
+    resp.as_object()
+        .into_iter()
+        .flat_map(|m| m.iter())
+        .filter(|(k, _)| *k != "meta")
+        .find_map(|(_, v)| {
+            v.pointer("/0/id")
+                .or_else(|| v.get("id"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn created_id(resp: &Value) -> Result<String> {
@@ -593,6 +1322,16 @@ impl Audit {
         let request = match &plan.action {
             Action::Create(body) => body.clone(),
             Action::Approve(id) => json!({ "approve": id }),
+            Action::Upload(u) => json!({
+                "upload": u.path.to_string_lossy(),
+                "fileName": u.file_name,
+                "ownerReference": u.owner,
+            }),
+            Action::Request(rq) => json!({
+                "method": rq.method,
+                "path": rq.path,
+                "body": rq.body,
+            }),
             Action::Skip(_) => Value::Null,
         };
         let entry = json!({
@@ -678,6 +1417,92 @@ mod tests {
         assert!(approve(vec![json!({"id": "x", "state": "voided"})]).is_err());
         let out = approve(vec![json!({"id": "x", "state": "draft", "voucherNo": "7"})]).unwrap();
         assert_eq!(out[0]["op"], "approve-draft");
+    }
+
+    #[test]
+    fn attach_names_and_types() {
+        assert_eq!(
+            header_safe_name("Faktura for løbende forbrug.pdf"),
+            "Faktura for loebende forbrug.pdf"
+        );
+        assert_eq!(content_type("a.PDF").unwrap(), "application/pdf");
+        assert_eq!(content_type("a.jpeg").unwrap(), "image/jpeg");
+        assert!(content_type("mail.eml").is_err());
+        assert!(content_type("noext").is_err());
+        assert_eq!(
+            name_key("Coop faktura 1.pdf"),
+            name_key("Coop-faktura-1.pdf")
+        );
+    }
+
+    #[test]
+    fn generic_changes_compare_and_find_ids() {
+        assert!(same_value(&json!("100.00"), &json!(100)));
+        assert!(same_value(&json!(true), &json!("true")));
+        assert!(!same_value(&json!("draft"), &json!("approved")));
+        assert!(!same_value(&Value::Null, &json!("")));
+        let rq = |id: Option<&str>, created_in: Option<&str>| Request {
+            method: "POST",
+            path: "contacts".into(),
+            body: None,
+            done: "created",
+            id: id.map(str::to_string),
+            created_in: created_in.map(str::to_string),
+            kind: Risk::Change,
+            bulk: None,
+        };
+        let resp =
+            json!({"meta": {"x": 1}, "contacts": [{"id": "c1"}], "contactPersons": [{"id": "p1"}]});
+        assert_eq!(request_id(&rq(None, Some("contacts")), &resp), "c1");
+        assert_eq!(request_id(&rq(Some("k"), None), &resp), "k");
+        assert_eq!(
+            request_id(&rq(None, None), &json!({"email": {"id": "e1"}})),
+            "e1"
+        );
+        assert_eq!(request_id(&rq(None, None), &Value::Null), "");
+    }
+
+    #[test]
+    fn bulk_groups_saves_and_deletes_per_resource() {
+        let req = |b: Option<Bulk>| Planned {
+            summary: json!({}),
+            action: Action::Request(Request {
+                method: "POST",
+                path: String::new(),
+                body: None,
+                done: "created",
+                id: None,
+                created_in: None,
+                kind: Risk::Change,
+                bulk: b,
+            }),
+        };
+        let save = |r: &str| {
+            Some(Bulk::Save {
+                resource: r.into(),
+                record: json!({}),
+            })
+        };
+        let del = |r: &str| {
+            Some(Bulk::Delete {
+                resource: r.into(),
+                id: "x".into(),
+            })
+        };
+        let planned = vec![
+            req(save("contacts")),
+            req(None),
+            req(del("contacts")),
+            req(save("contacts")),
+            req(save("products")),
+            req(del("contacts")),
+        ];
+        assert_eq!(
+            batches(&planned, true),
+            vec![vec![0, 3], vec![1], vec![2, 5], vec![4]]
+        );
+        assert_eq!(batches(&planned, false).len(), 6);
+        assert_eq!(url_encode("a b/ø"), "a%20b%2F%C3%B8");
     }
 
     #[test]

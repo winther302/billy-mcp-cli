@@ -11,6 +11,7 @@ pub type Query = Vec<(&'static str, String)>;
 
 pub struct Client {
     token: String,
+    base: String,
     agent: ureq::Agent,
     page_size: usize,
 }
@@ -27,21 +28,46 @@ impl Client {
             .unwrap_or(MAX_PAGE_SIZE);
         Ok(Self {
             token: crate::env::token()?,
+            // BILLY_API_BASE points billy at a test server; set it only for testing.
+            base: std::env::var("BILLY_API_BASE")
+                .ok()
+                .filter(|b| !b.trim().is_empty())
+                .map(|b| b.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| API_BASE.to_string()),
             agent,
             page_size,
         })
     }
 
-    pub fn get(&self, path: &str, query: &Query) -> Result<Value> {
+    pub fn get<K: AsRef<str>>(&self, path: &str, query: &[(K, String)]) -> Result<Value> {
         let mut req = self.request("GET", path);
         for (key, value) in query {
-            req = req.query(key, value);
+            req = req.query(key.as_ref(), value);
         }
         respond("GET", path, req.call())
     }
 
+    /// Any request, for generic changes: `body` is sent as JSON when given.
+    pub fn send(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+        let req = self.request(method, path);
+        let result = match body {
+            Some(b) => req.send_json(b),
+            None => req.call(),
+        };
+        respond(method, path, result)
+    }
+
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
         respond("POST", path, self.request("POST", path).send_json(body))
+    }
+
+    /// Uploads raw file bytes (Billy's `POST /files`).
+    pub fn post_file(&self, file_name: &str, content_type: &str, bytes: &[u8]) -> Result<Value> {
+        let req = self
+            .request("POST", "files")
+            .set("Content-Type", content_type)
+            .set("X-Filename", file_name);
+        respond("POST", "files", req.send_bytes(bytes))
     }
 
     pub fn put(&self, path: &str, body: &Value) -> Result<Value> {
@@ -50,7 +76,7 @@ impl Client {
 
     fn request(&self, method: &str, path: &str) -> ureq::Request {
         self.agent
-            .request(method, &format!("{API_BASE}/{path}"))
+            .request(method, &format!("{}/{path}", self.base))
             .set("X-Access-Token", &self.token)
             .set("Accept", "application/json")
             .set(
@@ -61,11 +87,19 @@ impl Client {
 
     /// Every record of a list resource, following Billy's paging. Fails rather
     /// than return a partial list.
-    pub fn list_all(&self, resource: &str, query: &Query) -> Result<Vec<Value>> {
+    pub fn list_all<K: AsRef<str>>(
+        &self,
+        resource: &str,
+        query: &[(K, String)],
+    ) -> Result<Vec<Value>> {
         let mut records = Vec::new();
         let mut total = None;
         for page in 1.. {
-            let mut q = query.clone();
+            let mut q: Vec<(&str, String)> = query
+                .iter()
+                .map(|(k, v)| (k.as_ref(), v.clone()))
+                .filter(|(k, _)| *k != "pageSize")
+                .collect();
             q.push(("page", page.to_string()));
             q.push(("pageSize", self.page_size.to_string()));
             let mut payload = self.get(resource, &q)?;
@@ -102,9 +136,17 @@ impl Client {
 
 fn respond(method: &str, path: &str, result: Result<ureq::Response, ureq::Error>) -> Result<Value> {
     match result {
-        Ok(resp) => resp
-            .into_json()
-            .with_context(|| format!("invalid JSON from {method} /{path}")),
+        Ok(resp) => {
+            // into_string caps at 10 MB; a page of 1000 records with embeds can be larger.
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut resp.into_reader(), &mut body)
+                .with_context(|| format!("reading the response to {method} /{path}"))?;
+            if body.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            serde_json::from_str(&body)
+                .with_context(|| format!("invalid JSON from {method} /{path}"))
+        }
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             bail!(

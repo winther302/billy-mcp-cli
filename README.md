@@ -97,19 +97,71 @@ billy draft ... | billy apply --confirm-cvr 12345678
 billy daybook --state draft --api-type billy-cli | billy approve | billy apply --confirm-cvr 12345678
 ```
 
+Attach the bilag (PDF, PNG or JPEG) to a daybook transaction, or leave out
+`--to` to put it in Billy's inbox:
+
+```sh
+billy attach invoice.pdf --to <daybook transaction id> | billy apply --confirm-cvr 12345678
+billy attach receipt.jpg --to bill:<bill id> | billy apply --confirm-cvr 12345678
+```
+
 - `--line ACCOUNT:AMOUNT[:TEXT]`: positive amounts are debits, negative are
   credits, and the lines must sum to zero.
-- Writes only ever create drafts or approve them. Nothing is deleted.
+- `draft`, `approve` and `attach` only ever create drafts, approve them or add
+  files. Deleting is possible only through `delete`, and needs `--allow-delete`.
 - Re-running is safe: a draft with the same marker (`--api-type`), date and
-  voucher number is skipped.
+  voucher number is skipped, as is an update that changes nothing, or a
+  `create --unique` whose record already exists.
 - Every applied change is appended to `billy-audit.ndjson`, next to the `.env`
   holding the token, or at `BILLY_AUDIT_LOG`.
+
+### Everything else in the API
+
+The commands above cover everyday bookkeeping. Generic commands reach every
+other resource in Billy's API (`billy resources` lists all 48 and what each
+supports): products, bank lines and matching, bank payments, VAT returns,
+invoice lines, reminders, contact persons, tax rates and more.
+
+| Command | Does |
+|---|---|
+| `list <resource> [key=value...]` | List records. Query parameters go to Billy as-is: filters, `include=invoice.lines:embed`, `sortProperty`, `sortDirection` |
+| `get <resource> [id...]` | Fetch records by id, or the ids of piped records. `get organization` and `get user` need no id |
+| `create <resource> FIELD...` | Describe a new record. `--unique f,g` skips it if a record with the same values exists |
+| `update <resource> [id] FIELD...` | Describe changing fields, of one record or of every piped record. The dry run shows from and to |
+| `delete <resource> [id...]` | Describe deleting records |
+| `call METHOD path [FIELD...]` | Any endpoint, such as `invoices/<id>/emails`. `GET` reads at once; other methods go through `apply` |
+
+FIELD is `key=text` or `key:=json` (numbers, `true`, arrays, objects), and
+dotted keys nest. `--json '{...}'` gives the whole record at once.
+
+```sh
+billy list bankLines isMatched=false | billy table
+billy create contacts name='Acme ApS' registrationNo=12345678 isCustomer:=true countryId=DK --unique registrationNo | billy apply
+billy invoices --state draft | billy update invoices state=approved | billy apply --confirm-cvr 12345678
+billy call POST invoices/<id>/emails email.contactPersonId=<id> email.emailSubject=Faktura email.emailBody='Se vedhæftet' \
+  | billy apply --confirm-cvr 12345678 --allow-send
+billy call GET 'invoiceLogs?invoiceId=<id>'
+```
+
+Two kinds of change need an extra flag on `apply`, because they cannot be
+taken back: deleting (`--allow-delete`), and sending emails, e-invoices or
+reminders to people outside the company (`--allow-send`).
+
+`apply --bulk` sends the creates and updates of one resource as a single bulk
+save (`PATCH /v2/<resource>` with every record), and its deletes as one bulk
+delete (`DELETE /v2/<resource>?ids[]=…`). Each bulk request succeeds or fails as
+a whole. Billy lists bulk operations as supported but does not document their
+format; these follow its API conventions.
+
+Billy ignores query parameters it does not know, so a misspelled filter
+returns everything. Check the count before relying on a filter.
 
 ### Language models
 
 Inside `billy run`, `apply --confirm-cvr` is refused unless the process was
 started with `BILLY_RUN_WRITES=1`. A model can always prepare and dry-run
-changes, but only a person can switch on writes for it.
+changes, but only a person can switch on writes for it. Deletes and sends also
+need `BILLY_RUN_DELETES=1` and `BILLY_RUN_SENDS=1` respectively.
 
 ## MCP server
 
@@ -141,7 +193,8 @@ Claude Desktop and other clients (`claude_desktop_config.json` or equivalent):
 
 Writes stay off for the assistant: it can draft and dry-run changes, but
 `apply --confirm-cvr` is refused unless you add `"BILLY_RUN_WRITES": "1"` to
-the server's environment. Output over 100 KB is cut at a line boundary with a
+the server's environment (plus `BILLY_RUN_DELETES` / `BILLY_RUN_SENDS` for
+deletes and sends). Output over 100 KB is cut at a line boundary with a
 note telling the assistant to narrow its query.
 
 ## Environment
@@ -150,7 +203,10 @@ note telling the assistant to narrow its query.
 |---|---|
 | `BILLY_KEY` | Access token (also read from `.env`) |
 | `BILLY_RUN_WRITES=1` | Allow `apply --confirm-cvr` inside `billy run` |
+| `BILLY_RUN_DELETES=1` | Also allow deletes inside `billy run` |
+| `BILLY_RUN_SENDS=1` | Also allow emails, e-invoices and reminders inside `billy run` |
 | `BILLY_AUDIT_LOG` | Path of the audit log |
+| `BILLY_API_BASE` | Send requests to another server, such as a mock, for testing (the token goes there too) |
 | `BILLY_PAGE_SIZE` | Smaller API pages (1–1000), for testing paging |
 
 ## License
