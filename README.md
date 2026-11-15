@@ -113,7 +113,9 @@ billy attach receipt.jpg --to bill:<bill id> | billy apply --confirm-cvr 1234567
   voucher number is skipped, as is an update that changes nothing, or a
   `create --unique` whose record already exists.
 - Every applied change is appended to `billy-audit.ndjson`, next to the `.env`
-  holding the token, or at `BILLY_AUDIT_LOG`.
+  holding the token, or at `BILLY_AUDIT_LOG`. On Unix, new logs are created
+  owner-only; applying changes is refused if an existing log is accessible by
+  group or other users. Restrict it with `chmod 600 <path>` to continue.
 
 ### Everything else in the API
 
