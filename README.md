@@ -153,6 +153,11 @@ delete (`DELETE /v2/<resource>?ids[]=…`). Each bulk request succeeds or fails 
 a whole. Billy lists bulk operations as supported but does not document their
 format; these follow its API conventions.
 
+Line and child resources only list when filtered by their parent, e.g.
+`list invoiceLines invoiceId=…` or `list bankLines accountId=…`; the
+`listNeeds` field of `billy resources` names the filter. A company access token
+cannot list `files`, `organizations` or `users`.
+
 Billy ignores query parameters it does not know, so a misspelled filter
 returns everything. Check the count before relying on a filter.
 

@@ -87,6 +87,34 @@ pub const RESOURCES: &[Resource] = &[
     r("zipcodes", "glcu-", false),
 ];
 
+/// List endpoints Billy refuses without a parent filter (learned from the live
+/// API: "You need to filter the list by …").
+const LIST_FILTERS: &[(&str, &str)] = &[
+    ("balanceModifiers", "modifierReference"),
+    ("bankLineMatches", "accountId"),
+    ("bankLines", "accountId"),
+    ("bankLineSubjectAssociations", "matchId"),
+    ("billLines", "billId"),
+    ("cities", "countryId"),
+    ("contactBalancePostings", "contactId"),
+    ("contactPersons", "contactId"),
+    ("daybookBalanceAccounts", "daybookId"),
+    ("daybookTransactionLines", "daybookTransactionId"),
+    ("invoiceLateFees", "invoiceId"),
+    ("invoiceLines", "invoiceId"),
+    ("invoiceReminderAssociations", "reminderId"),
+    ("productPrices", "productId"),
+    ("salesTaxPayments", "returnId"),
+    ("salesTaxRules", "rulesetId"),
+    ("states", "countryId"),
+    ("taxRateDeductionComponents", "taxRateId"),
+    ("zipcodes", "countryId"),
+];
+
+/// Resources a company access token may not list (Billy answers 403); they
+/// need a user's token.
+const USER_TOKEN_ONLY: &[&str] = &["files", "organizations", "users"];
+
 /// Single-record endpoints that need no id.
 const SINGLETONS: &[&str] = &["organization", "user"];
 
@@ -109,6 +137,14 @@ impl Resource {
         .map(|(_, op)| *op)
         .collect::<Vec<_>>()
         .join(", ")
+    }
+
+    /// The query parameter Billy insists on when listing this resource.
+    pub fn list_filter(&self) -> Option<&'static str> {
+        LIST_FILTERS
+            .iter()
+            .find(|(r, _)| *r == self.name)
+            .map(|(_, f)| *f)
     }
 
     pub fn require(&self, op: &str) -> Result<()> {
@@ -248,6 +284,8 @@ pub fn resources(_: ResourcesArgs) -> Vec<Value> {
                 "create": r.create,
                 "update": r.update,
                 "delete": r.delete,
+                "listNeeds": r.list_filter(),
+                "companyTokenCanList": !USER_TOKEN_ONLY.contains(&r.name),
             })
         })
         .collect()
@@ -269,6 +307,15 @@ pub fn list(a: ListArgs) -> Result<Vec<Value>> {
     let res = resource(&a.resource)?;
     res.require("list")?;
     let q = query(&a.params)?;
+    if let Some(f) = res.list_filter() {
+        if !q.iter().any(|(k, _)| k == f) {
+            bail!(
+                "Billy only lists {} filtered by their parent: add {f}=<id>, e.g. `list {} {f}=…`",
+                res.name,
+                res.name
+            );
+        }
+    }
     let client = Client::from_env()?;
     // An explicit page is fetched as asked; otherwise every page is.
     if q.iter().any(|(k, _)| k == "page") {
@@ -526,6 +573,22 @@ mod tests {
         for r in RESOURCES {
             assert_eq!(resource(r.name).unwrap().name, r.name);
             assert_eq!(resource(&r.singular()).unwrap().name, r.name);
+        }
+    }
+
+    #[test]
+    fn child_lists_need_their_parent_filter() {
+        let e = list(ListArgs {
+            resource: "invoice-lines".into(),
+            params: vec![],
+        })
+        .unwrap_err();
+        assert!(e.to_string().contains("invoiceId="), "{e}");
+        for (name, _) in LIST_FILTERS {
+            assert!(resource(name).unwrap().list, "{name}");
+        }
+        for name in USER_TOKEN_ONLY {
+            resource(name).unwrap();
         }
     }
 
